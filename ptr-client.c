@@ -52,7 +52,7 @@
 extern char *optarg;	
 extern int optind, opterr, optopt;
 
-char version[] = "2.1";
+char version[] = "2.2";
 
 int delay_num = 0;
 int packet_size = PacketSize;
@@ -68,11 +68,12 @@ double probing_start_time = 0, probing_end_time = 0;
 
 uint16 dst_port = START_PORT, src_port = 0, probing_port;
 uint32 dst_ip, src_ip;
-char dst_hostname[MAXHOSTNAMELEN], src_hostname[MAXHOSTNAMELEN];
-char dst_ip_str[16], src_ip_str[16];
-char dst[MAXHOSTNAMELEN], src[MAXHOSTNAMELEN];
+char dst_hostname[NI_MAXHOST], src_hostname[NI_MAXHOST];
+char dst_ip_str[NI_MAXHOST], src_ip_str[NI_MAXHOST];
+char dst_port_str[NI_MAXSERV], src_port_str[NI_MAXSERV];
+char dst[NI_MAXHOST], src[NI_MAXHOST];
 int control_sock, probing_sock;
-struct sockaddr_in probing_server, probing_server2 ;
+struct sockaddr_storage probing_server, probing_server2 ;
 
 RETSIGTYPE (*oldhandler)(int);
 
@@ -325,30 +326,90 @@ void dump_bandwidth()
 	}
 }
 
-int init_sockets(uint32 dst_ip)
+int init_sockets(const struct sockaddr *dst_ip)
 {
-	struct sockaddr_in client;
+	struct addrinfo hints, *res, *res0;
+	char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];	
+	struct sockaddr_storage client;
 
-	probing_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	/* probing socket */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_family = AF_UNSPEC;
+	snprintf(sbuf, sizeof(sbuf), "%u", probing_port);
+	if (getaddrinfo(dst, sbuf, &hints, &res0)) {
+		perror("getaddrinfo");
+		exit(1);
+	}
+	for (res = res0; res; res = res->ai_next) {
+		if (getnameinfo(res->ai_addr, res->ai_addrlen, 
+							hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), 
+							NI_NUMERICHOST | NI_NUMERICSERV)) {
+			perror("getnameinfo");
+			continue;
+		}
 
-	probing_server.sin_family = AF_INET;
-	probing_server.sin_addr.s_addr = dst_ip;
-	probing_server.sin_port = htons(probing_port);
+		memcpy(&probing_server, res->ai_addr, res->ai_addrlen);
+	}
 
-	/* used for sending the tail "junk" packet */
-	probing_server2.sin_family = AF_INET;
-	probing_server2.sin_addr.s_addr = dst_ip;
-	probing_server2.sin_port = htons(probing_port+1);
+	/* dummy */
+	memset(&hints, 0, sizeof(hints));
+	snprintf(sbuf, sizeof(sbuf), "%u", probing_port + 1);
+	if (getaddrinfo(dst, sbuf, &hints, &res0)) {
+		perror("getaddrinfo");
+		exit(1);
+	}
 
-	client.sin_addr.s_addr = htonl(INADDR_ANY);
-	client.sin_family = AF_INET;
-	client.sin_port = htons(0);
+	for (res = res0; res; res = res->ai_next) {
+		if (getnameinfo(res->ai_addr, res->ai_addrlen, 
+							hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), 
+							NI_NUMERICHOST | NI_NUMERICSERV)) {
+			perror("getnamerinfo");
+			continue;
+		}
 
-        if (bind(probing_sock, (const struct sockaddr *) &client,
-                 sizeof(client)) < 0) {
-           fprintf(stderr, "server: Unable to bind local address.\n");
-           quit();
+		memcpy(&probing_server2, res->ai_addr, res->ai_addrlen);
+	}
+
+	/* client */
+	memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
+	//hints.ai_family = AF_UNSPEC;
+	if (getaddrinfo(NULL, "0", &hints, &res0)) {
+		perror("getaddrinfo");
+		exit(1);
+	}
+
+	for (res = res0; res; res = res->ai_next) {
+		probing_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+		if (probing_sock < 0) {
+			close(probing_sock);
+			continue;
+		}
+		if (bind(probing_sock, res->ai_addr, res->ai_addrlen) < 0) {
+			perror("bind");
+			close(probing_sock);
+			continue;
         }
+
+		if (getnameinfo(res->ai_addr, res->ai_addrlen, 
+							hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), 
+							NI_NUMERICHOST | NI_NUMERICSERV)) {
+			perror("getanmeinfo");
+			continue;
+		}
+
+		if (res->ai_family == dst_ip->sa_family) {
+			printf("bind to %s port %s\n", hbuf, sbuf);
+			break;
+		}
+	}
+
+	if (probing_sock < 0) {
+		perror("socket");
+		exit(1);
+	}
 
 #ifndef LINUX
         if (fcntl(probing_sock, F_SETFL, O_NDELAY) < 0) {
@@ -446,8 +507,9 @@ void get_item(int control_sock, char *str)
             cur_len = read(control_sock, msg_buf+msg_len, sizeof(msg_buf) - msg_len);
 	    /* guard against control channel breaks */
 	    if (cur_len <= 0) {
-		printf("read failed in get_item()\n");
-		quit();
+			perror("read");
+			printf("read failed in get_item()\n");
+			quit();
 	    }
 					
 	    msg_len += cur_len;
@@ -475,9 +537,11 @@ out:
 
 void init_connection() 
 {
-	struct sockaddr_in server, src_addr;
+	struct sockaddr_storage server, src_addr;
+	struct addrinfo hints, *res, *res0;
+	char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
 	int src_size, result, msg_len;
-	char cur_str[16], msg_buf[64];
+	char cur_str[NI_MAXSERV], msg_buf[64];
 
 	/* Setup signal handler for cleaning up */
 	(void)setsignal(SIGTERM, cleanup);
@@ -485,69 +549,93 @@ void init_connection()
 	if ((oldhandler = setsignal(SIGHUP, cleanup)) != SIG_DFL) 
 	    (void)setsignal(SIGHUP, oldhandler);
 
-  	/* Get hostname and IP address of target host */
-  	if (get_host_info(dst, dst_hostname, &dst_ip, dst_ip_str) < 0) {
-    	    quit();
-  	}
+  	// /* Get hostname and IP address of target host */
+  	// if (get_host_info(dst, dst_hostname, &dst_ip, dst_ip_str) < 0) {
+    // 	    quit();
+  	// }
+    
+	memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
 
-        server.sin_addr.s_addr = dst_ip;
-        server.sin_family = AF_INET;
+	while (dst_port < END_PORT) {
+		dst_port ++; // Starting port number is START_PORT + 1
+		snprintf(sbuf, sizeof(sbuf), "%u", dst_port);
+		if (getaddrinfo(dst, sbuf, &hints, &res0)) {
+			perror("getaddrinfo");
+			exit(1);
+		}
+		for (res = res0; res; res = res->ai_next) {
+			if (getnameinfo(res->ai_addr, res->ai_addrlen, 
+								hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), 
+								NI_NUMERICHOST | NI_NUMERICSERV)) {
+				perror("getnamerinfo");
+				continue;
+			}
+			printf("trying %s port %s\n", hbuf, sbuf);
 
-	/* search for the right dst port to connect with */
-        control_sock = socket(AF_INET, SOCK_STREAM, 0);
-       	++dst_port;
-        server.sin_port = htons(dst_port);
-        result = connect(control_sock, (struct sockaddr *)&server, sizeof(server));
-   	while ((result < 0) && (dst_port < END_PORT)) {
-	    close(control_sock);
-            control_sock = socket(AF_INET, SOCK_STREAM, 0);
-       	    ++dst_port;
-            server.sin_port = htons(dst_port);
-            result = connect(control_sock, (struct sockaddr *)&server, sizeof(server));
-	    if (verbose)
-	        printf("dst_port = %d\n", dst_port);
-   	};
-   	if (result < 0) {
-       	    perror("no dst port found, connection fails\n");
+			control_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+			if (control_sock < 0) {
+				close(control_sock);
+				control_sock = -1;
+				continue;
+			}
+			if ((result = connect(control_sock, res->ai_addr, res->ai_addrlen)) < 0) {
+				close(control_sock);
+				control_sock = -1;
+				continue;
+			}
+
+			//server = res->ai_addr;
+			memcpy(&server, res->ai_addr, sizeof(struct sockaddr_storage));
+			break;
+		}
+
+		// TODO: Searching for port numbers
+		break;
+	}
+
+	if (result < 0) {
+		perror("no dst port found, connection fails\n");
 	    quit();
 	}
 
 	/* Get hostname and IP address of source host */
-
-	src_size = sizeof(struct sockaddr);
+	src_size = sizeof(struct sockaddr_storage);
 	getsockname(control_sock, (struct sockaddr *)&src_addr, &src_size);
-	strcpy(src, inet_ntoa(src_addr.sin_addr));
-
-	if (get_host_info(src, src_hostname, &src_ip, src_ip_str) < 0) {
-	    printf("get source address info fails, exit\n");
-	    quit();
+	if (getnameinfo((struct sockaddr *)&src_addr, &src_size,
+				hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+				NI_NUMERICHOST | NI_NUMERICSERV)) {
+		perror("getnameinfo");
+		exit(1);
 	}
+	strncpy(src, hbuf, sizeof(hbuf));
+	src_port = atoi(sbuf);
 
 	if (verbose) {
-	    printf("src addr: %s\n", src_ip_str);
-	    printf("dst addr: %s\n", dst_ip_str);
+	    printf("src addr: %s (%d)\n", src, src_port);
+	    printf("dst addr: %s (%d)\n", dst, dst_port);
 	}
 
-        /* send START message */
+    /* send START message */
 	sprintf(msg_buf, "$START$%d$", probe_num);
 	msg_len = strlen(msg_buf);
-        write(control_sock, msg_buf, msg_len);
+	write(control_sock, msg_buf, msg_len);
 
-        /* wait for READY ack */
+    /* wait for READY ack */
 	get_item(control_sock, cur_str);
 	if (verbose)
 	    printf("we get str: %s\n", cur_str);
-        if (strncmp(cur_str, "READY", 5) != 0) {
-	    printf("get unknow str when waiting for READY from dst, exit\n");
-	    quit();
-        }
+	if (strncmp(cur_str, "READY", 5) != 0) {
+		printf("get unknow str when waiting for READY from dst, exit\n");
+		quit();
+	}
 
 	get_item(control_sock, cur_str);
 	if (verbose)
 	    printf("probing_port = %s\n", cur_str);
 	probing_port = atoi(cur_str);
 
-	if (init_sockets(dst_ip) == 0) {
+	if (init_sockets((struct sockaddr *)&server) == 0) {
 	    perror("init sockets failed");
 	    quit();
 	}
@@ -561,6 +649,7 @@ void send_packets(int probe_num, int packet_size, int delay_num, double *sent_ti
 	int i, k;
 	double tmp = 133333.0003333;
 	char send_buf[4096];
+	ssize_t send_ret;
 
 	/* send out probing packets */
 	for (i=0; i<probe_num-1; i++) {
@@ -568,7 +657,11 @@ void send_packets(int probe_num, int packet_size, int delay_num, double *sent_ti
 	     * we don't use sanity-check */
 	    sent_times[i] = get_time();
 	    send_buf[0] = i;
-	    sendto(probing_sock, send_buf, packet_size, 0, (struct sockaddr *)&(probing_server), sizeof(probing_server));
+	   	send_ret = sendto(probing_sock, send_buf, packet_size, 0, (struct sockaddr *)&(probing_server), sizeof(probing_server));
+		if (send_ret < 0) {
+			printf("server's family=%d\n", probing_server.ss_family);
+			perror("sendto");
+		}
 
 	    /* gap generation */
 	    for (k=0; k<delay_num; k++) {
@@ -579,9 +672,17 @@ void send_packets(int probe_num, int packet_size, int delay_num, double *sent_ti
 
 	/* the last packets */
 	send_buf[0] = i;
-	sendto(probing_sock, send_buf, packet_size, 0, (struct sockaddr *)&(probing_server), sizeof(probing_server));
+	send_ret = sendto(probing_sock, send_buf, packet_size, 0, (struct sockaddr *)&(probing_server), sizeof(probing_server));
+	if (send_ret < 0) {
+		printf("server's family=%d\n", probing_server.ss_family);
+		perror("sendto");
+	}
 
-	sendto(probing_sock, send_buf, 40, 0, (struct sockaddr *)&(probing_server2), sizeof(probing_server2));
+	send_ret = sendto(probing_sock, send_buf, 40, 0, (struct sockaddr *)&(probing_server2), sizeof(probing_server2));
+	if (send_ret < 0) {
+		printf("server2's family=%d\n", probing_server2.ss_family);
+		perror("sendto");
+	}
 	sent_times[probe_num-1] = get_time();
 }
 
@@ -1034,7 +1135,7 @@ int main(int argc, char *argv[])
 	}
 	switch (argc - optind) {
         case 1:
-	    strcpy(dst, argv[optind]);
+	    strncpy(dst, argv[optind], sizeof(dst));
 	    break;
 	default:
 	    Usage();

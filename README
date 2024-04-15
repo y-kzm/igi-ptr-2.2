@@ -1,4 +1,7 @@
-			IGI/PTR v2.1
+			IGI/PTR v2.2
+
+This is not my code, the original can be found - https://www.cs.cmu.edu/~hnn/igi/
+I've updated it a little bit for IPv6 support.
 
 IGI/PTR is an end-to-end available bandwidth measurement tool, it implements two algorith: IGI (Initial Gap Increasing) and PTR (Packet Transmission Rate). For more details, see http://www.cs.cmu.edu/~hnn/igi.
 

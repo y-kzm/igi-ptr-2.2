@@ -32,6 +32,7 @@
 
 #define BUF_SIZE		4096
 #define MAXIPSTRLEN		(16)
+#define MAX_SOCK        (20)
 
 #define START_PORT 		(10*1024) 
 #define END_PORT   		(0xFFFF)
